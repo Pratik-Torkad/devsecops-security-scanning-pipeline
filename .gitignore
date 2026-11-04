@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+terraform.tfvars.json
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+kubeconfig
+.aws/
+
+# Scanner output
+reports/
+*.sarif
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

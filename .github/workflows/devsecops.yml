@@ -1,0 +1,192 @@
+name: DevSecOps Security Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: devsecops-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests-and-image-scan:
+    name: Tests, Docker build and Trivy image scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: pytest -q
+
+      - name: Build demo container
+        run: docker build --pull -t local/devsecops-demo:${{ github.sha }} .
+
+      - name: Create report directory
+        run: mkdir -p reports
+
+      - name: Scan container image with Trivy
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/" \
+            -v "$PWD/reports:/reports" \
+            aquasec/trivy:0.76.1 image \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format sarif \
+            --output /reports/trivy-image.sarif \
+            --exit-code 0 \
+            local/devsecops-demo:${{ github.sha }}
+
+      - name: Upload Trivy image findings to Code Scanning
+        if: always() && hashFiles('reports/trivy-image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-container-image
+
+      - name: Archive image scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-container-image-report
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  infrastructure-scan:
+    name: Terraform, Kubernetes and filesystem scans
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+
+      - name: Check Terraform formatting
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      - name: Initialize Terraform without backend
+        working-directory: terraform
+        run: terraform init -backend=false
+
+      - name: Validate Terraform
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Create report directory
+        run: mkdir -p reports
+
+      - name: Scan infrastructure configuration with Checkov
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            -w /repo \
+            ghcr.io/bridgecrewio/checkov:3.3.29 \
+            -d /repo \
+            --framework terraform,kubernetes,dockerfile \
+            --output sarif \
+            --output-file-path /repo/reports/checkov.sarif \
+            --soft-fail \
+            --quiet
+
+      - name: Scan repository files with Trivy
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            aquasec/trivy:0.76.1 fs \
+            --scanners vuln,misconfig,secret \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format sarif \
+            --output /repo/reports/trivy-filesystem.sarif \
+            --exit-code 0 \
+            /repo
+
+      - name: Upload Checkov findings to Code Scanning
+        if: always() && hashFiles('reports/checkov.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/checkov.sarif
+          category: checkov-iac
+
+      - name: Upload Trivy filesystem findings to Code Scanning
+        if: always() && hashFiles('reports/trivy-filesystem.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/trivy-filesystem.sarif
+          category: trivy-filesystem
+
+      - name: Archive infrastructure scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: infrastructure-security-reports
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  secret-scan:
+    name: Gitleaks full Git history scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout complete Git history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create report directory
+        run: mkdir -p reports
+
+      - name: Scan Git history with Gitleaks
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            -w /repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git . \
+            --redact \
+            --report-format sarif \
+            --report-path /repo/reports/gitleaks.sarif \
+            --exit-code 1
+
+      - name: Upload Gitleaks findings to Code Scanning
+        if: always() && hashFiles('reports/gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/gitleaks.sarif
+          category: gitleaks-secrets
+
+      - name: Archive Gitleaks report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 14
